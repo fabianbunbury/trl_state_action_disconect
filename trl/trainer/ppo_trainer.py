@@ -399,6 +399,103 @@ class PPOTrainer(BaseTrainer):
 
         return queries, responses, scores
 
+
+    def step_Undeterministic_states(
+        self,
+        actions: List[torch.LongTensor],
+        states: List[torch.LongTensor],
+        queries: List[torch.LongTensor],
+        responses: List[torch.LongTensor],
+        scores: List[torch.FloatTensor],
+    ):
+        """
+        Run a PPO optimisation step given a list of queries, model responses, and rewards.
+
+        Args:
+            queries (List[`torch.LongTensor`]):
+                List of tensors containing the encoded queries of shape (`query_length`)
+            responses (List[`torch.LongTensor`]):
+                List of tensors containing the encoded responses of shape (`response_length`)
+            scores (List[`torch.FloatTensor`]):
+                List of tensors containing the scores.
+
+        Returns:
+            `dict[str, Any]`: A summary of the training statistics
+        """
+        bs = self.config.batch_size
+
+        queries, responses, scores = self._step_safety_checker(bs, queries, responses, scores)
+
+        timing = dict()
+        t0 = time.time()
+
+        t = time.time()
+
+        logprobs, ref_logprobs, values = self.batched_forward_pass(queries, responses)
+        timing["time/ppo/forward_pass"] = time.time() - t
+
+        t = time.time()
+        rewards, non_score_reward = self.compute_rewards(scores, logprobs, ref_logprobs)
+        timing["time/ppo/compute_rewards"] = time.time() - t
+
+        t = time.time()
+        all_stats = []
+        idxs = list(range(bs))
+        for _ in range(self.config.ppo_epochs):
+            random.shuffle(idxs)
+            for i in range(bs):
+                idx = idxs[i]
+                train_stats = self.train_minibatch(
+                    logprobs[idx].unsqueeze(0),
+                    values[idx].unsqueeze(0),
+                    rewards[idx].unsqueeze(0),
+                    queries[idx].unsqueeze(0),
+                    responses[idx].unsqueeze(0),
+                    torch.cat([queries[idx], responses[idx]]).unsqueeze(0),
+                )
+                all_stats.append(train_stats)
+        timing["time/ppo/optimize_step"] = time.time() - t
+
+        t = time.time()
+        train_stats = stack_dicts(all_stats)
+
+        # reshape advantages/ratios such that they are not averaged.
+        train_stats["policy/advantages"] = torch.flatten(train_stats["policy/advantages"]).unsqueeze(0)
+        train_stats["policy/advantages"] = torch.nan_to_num(train_stats["policy/advantages"], WANDB_PADDING)
+        train_stats["policy/ratio"] = torch.flatten(train_stats["policy/ratio"]).unsqueeze(0)
+
+        stats = self.record_step_stats(
+            scores=scores,
+            logprobs=logprobs,
+            ref_logprobs=ref_logprobs,
+            non_score_reward=non_score_reward,
+            train_stats=train_stats,
+            kl_coef=self.kl_ctl.value,
+        )
+        # Gather/Reduce stats from all processes
+        if self.is_distributed:
+            stats = self.gather_stats(stats)
+        stats = stats_to_np(stats)
+        timing["time/ppo/calc_stats"] = time.time() - t
+        stats["ppo/learning_rate"] = self.optimizer.param_groups[0]["lr"]
+
+        # Update the KL control - multiply the batch_size by the number of processes
+        self.kl_ctl.update(stats["objective/kl"], self.config.batch_size * self.accelerator.num_processes)
+
+        # Log the total ppo time
+        timing["time/ppo/total"] = time.time() - t0
+        stats.update(timing)
+
+        # post-process stats for tensorboard and other loggers
+        if self.config.log_with != "wandb":
+            stats = convert_to_scalar(stats)
+
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+
+        return stats
+
+
     def step(
         self,
         queries: List[torch.LongTensor],
