@@ -268,6 +268,10 @@ class PPOTrainer(BaseTrainer):
                 "Forward batch size > 1 is not well supported yet for encoder-decoder models and when using `tokenizer.padding_side='left'`. This can lead to unexpected behaviour."
                 " therefore, we recommend using forward_batch_size=1."
             )
+    
+        ## Fabian here: using torch implimentation of kldivergence loss.
+        self.kl_loss_object = nn.KLDivLoss(reduction="batchmean", log_target = True)
+
 
     def _filter_kwargs(self, kwargs, target_func):
         """
@@ -399,6 +403,78 @@ class PPOTrainer(BaseTrainer):
 
         return queries, responses, scores
 
+
+    def step_with_rewards_per_step(
+            self,
+            queries: List[torch.LongTensor],
+            responses: List[torch.LongTensor],
+            scores: List[torch.FloatTensor]
+        ):
+        """
+            Run a PPO optimisation step given a list of queries, model responses, and rewards.
+
+            Args:
+                queries (List[`torch.LongTensor`]):
+                    List of tensors containing the encoded queries of shape (`query_length`)
+                responses (List[`torch.LongTensor`]):
+                    List of tensors containing the encoded responses of shape (`response_length`)
+                scores (List[`torch.FloatTensor`]):
+                    List of tensors containing the scores of shape ('response_length')
+
+            Returns:
+                `dict[str, Any]`: A summary of the training statistics
+        """
+
+      
+        bs = self.config.batch_size
+
+        queries, responses, scores = self._step_safety_checker(bs, queries, responses, scores)
+
+
+        timing = dict()
+        t0 = time.time()
+
+        t = time.time()
+
+        logprobs, ref_logprobs, values = self.batched_forward_pass(queries, responses)
+        timing["time/ppo/forward_pass"] = time.time() - t
+
+
+        t = time.time()
+        # The other implimentation adds the kl divergence from the reference policy to the rewards
+
+        # rewards, non_score_reward = self.compute_rewards_fabian(scores, logprobs, ref_logprobs)
+        timing["time/ppo/compute_rewards"] = time.time() - t
+
+
+        t = time.time()
+        all_stats = []
+        idxs = list(range(bs))
+        for _ in range(self.config.ppo_epochs):
+            random.shuffle(idxs)
+            for i in range(bs):
+                idx = idxs[i]
+
+                kl_divergence_loss = self.kl_loss_object(logprobs, ref_logprobs)
+
+
+
+
+
+                # train_stats = self.train_minibatch(
+                #     logprobs[idx].unsqueeze(0),
+                #     values[idx].unsqueeze(0),
+                #     rewards[idx].unsqueeze(0),
+                #     queries[idx].unsqueeze(0),
+                #     responses[idx].unsqueeze(0),
+                #     torch.cat([queries[idx], responses[idx]]).unsqueeze(0),
+                # )
+                all_stats.append(train_stats)
+        timing["time/ppo/optimize_step"] = time.time() - t
+
+
+
+        
     def step(
         self,
         queries: List[torch.LongTensor],
