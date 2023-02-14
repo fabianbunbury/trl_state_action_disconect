@@ -430,7 +430,6 @@ class PPOTrainer(BaseTrainer):
 
         queries, responses, scores = self._step_safety_checker(bs, queries, responses, scores)
 
-
         timing = dict()
         t0 = time.time()
 
@@ -456,7 +455,16 @@ class PPOTrainer(BaseTrainer):
                 idx = idxs[i]
 
                 kl_divergence_loss = self.kl_loss_object(logprobs, ref_logprobs)
+                
+                loss_p, loss_v, train_stats = self.loss(logprobs, values, rewards, query, response, model_input)
 
+                loss = loss_p + loss_v + loss_p
+                self.optimizer.zero_grad()
+                self.accelerator.backward(loss)
+                t = time.time()
+                self.optimizer.step()
+                train_stats["time/ppo/optimizer_step"] = torch.Tensor([time.time() - t]).to(self.accelerator.device)
+                return train_stats
 
 
 
@@ -514,7 +522,7 @@ class PPOTrainer(BaseTrainer):
         t = time.time()
         all_stats = []
         idxs = list(range(bs))
-        for _ in range(self.config.ppo_epochs):
+        for _ in range(self.config.ppo_epochs): 
             random.shuffle(idxs)
             for i in range(bs):
                 idx = idxs[i]
@@ -754,19 +762,32 @@ class PPOTrainer(BaseTrainer):
                 Encoded responses, shape (`batch_size`, `response_length`)
             model_input (`torch.LongTensor`):
                 Concatenated queries and responses, shape (`batch_size`, `query_length+response_length`)
+
+            outputs:
+                losses
         """
         lastgaelam = 0
         advantages_reversed = []
         gen_len = rewards.shape[-1]
 
+        index_of_next_values = torch.repeat(torch.arange(1,mask.size()[1]))*mask
+
         for t in reversed(range(gen_len)):
+
+            if at_non_action_trasition:
+
+            else: 
+            next_state = index_of_next_values[:,t]
+            nextvalues = values[torch.arange(values.size()[0]), next_state] if t < gen_len - 1 else 0.0 # fabians one torch.arange(config['batch_size']),torch.tensor(index_of_last_non_padded_tokens)-1
+
             nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
             delta = rewards[:, t] + self.config.gamma * nextvalues - values[:, t]
-            lastgaelam = delta + self.config.gamma * self.config.lam * lastgaelam
+            lastgaelam = delta + self.config.gamma * self.config.lam * lastgaelam ## Fabian Here: td lambda component 
             advantages_reversed.append(lastgaelam)
         advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
-
-        returns = advantages + values
+        ##advantages shape [batch size * time steps]
+        returns = advantages + values 
+        # Fabian here: whiten this divides each feature dimension by its standard deviation. i,e features that are very close together get spread apart
         advantages = whiten(advantages)
         advantages = advantages.detach()
 
@@ -794,6 +815,14 @@ class PPOTrainer(BaseTrainer):
 
         vf_losses1 = (vpred - returns) ** 2
         vf_losses2 = (vpredclipped - returns) ** 2
+
+        ###Fabian Here if mask loss function
+        if use_mask:
+            vf_losses1 = vf_losses1*mask
+            vf_losses2 = vf_losses2*mask
+            advantages =advantages*mask
+
+
         vf_loss = 0.5 * torch.mean(torch.max(vf_losses1, vf_losses2))
         vf_clipfrac = torch.mean(torch.gt(vf_losses2, vf_losses1).double())
 
