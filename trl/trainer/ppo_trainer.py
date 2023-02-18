@@ -270,7 +270,7 @@ class PPOTrainer(BaseTrainer):
             )
     
         ## Fabian here: using torch implimentation of kldivergence loss.
-        self.kl_loss_object = nn.KLDivLoss(reduction="batchmean", log_target = True)
+        # self.kl_loss_object = nn.KLDivLoss(reduction="batchmean", log_target = True)
 
 
     def _filter_kwargs(self, kwargs, target_func):
@@ -427,27 +427,20 @@ class PPOTrainer(BaseTrainer):
                 `dict[str, Any]`: A summary of the training statistics
         """
 
-      
         bs = self.config.batch_size
 
         queries, responses, scores = self._step_safety_checker(bs, queries, responses, scores)
 
-
         timing = dict()
         t0 = time.time()
-
         t = time.time()
 
         logprobs, ref_logprobs, values = self.batched_forward_pass(queries, responses)
         timing["time/ppo/forward_pass"] = time.time() - t
 
-
         t = time.time()
-        # The other implimentation adds the kl divergence from the reference policy to the rewards
-
-        # rewards, non_score_reward = self.compute_rewards_fabian(scores, logprobs, ref_logprobs)
+        rewards, non_score_reward = self.compute_rewards(scores, logprobs, ref_logprobs)
         timing["time/ppo/compute_rewards"] = time.time() - t
-
 
         t = time.time()
         all_stats = []
@@ -457,20 +450,22 @@ class PPOTrainer(BaseTrainer):
             for i in range(bs):
                 idx = idxs[i]
 
-                kl_divergence_loss = self.kl_loss_object(logprobs, ref_logprobs)
+                breakpoint()
+                loss_p, loss_v, train_stats = self.masked_loss(logprobs[idx].unsqueeze(0), 
+                                                        values[idx].unsqueeze(0), 
+                                                        rewards[idx].unsqueeze(0),
+                                                        queries[idx].unsqueeze(0), 
+                                                        responses[idx].unsqueeze(0), 
+                                                        torch.cat([queries[idx], responses[idx]]).unsqueeze(0),
+                                                        mask[idx].unsqueeze(0))
 
+                loss = loss_p + loss_v
+                self.optimizer.zero_grad()
+                self.accelerator.backward(loss)
+                t = time.time()
+                self.optimizer.step()
+                train_stats["time/ppo/optimizer_step"] = torch.Tensor([time.time() - t]).to(self.accelerator.device)
 
-
-
-
-                # train_stats = self.train_minibatch(
-                #     logprobs[idx].unsqueeze(0),
-                #     values[idx].unsqueeze(0),
-                #     rewards[idx].unsqueeze(0),
-                #     queries[idx].unsqueeze(0),
-                #     responses[idx].unsqueeze(0),
-                #     torch.cat([queries[idx], responses[idx]]).unsqueeze(0),
-                # )
                 all_stats.append(train_stats)
         timing["time/ppo/optimize_step"] = time.time() - t
 
@@ -520,24 +515,14 @@ class PPOTrainer(BaseTrainer):
             random.shuffle(idxs)
             for i in range(bs):
                 idx = idxs[i]
-
-                # train_stats = self.train_minibatch(
-                #     logprobs[idx].unsqueeze(0),
-                #     values[idx].unsqueeze(0),
-                #     rewards[idx].unsqueeze(0),
-                #     queries[idx].unsqueeze(0),
-                #     responses[idx].unsqueeze(0),
-                #     torch.cat([queries[idx], responses[idx]]).unsqueeze(0),
-                # )
-
-                loss_p, loss_v, train_stats = self.loss(logprobs, values, rewards, query, response, model_input, mask)
-                loss = loss_p + loss_v
-                self.optimizer.zero_grad()
-                self.accelerator.backward(loss)
-                t = time.time()
-                self.optimizer.step()
-                train_stats["time/ppo/optimizer_step"] = torch.Tensor([time.time() - t]).to(self.accelerator.device)
-
+                train_stats = self.train_minibatch(
+                    logprobs[idx].unsqueeze(0),
+                    values[idx].unsqueeze(0),
+                    rewards[idx].unsqueeze(0),
+                    queries[idx].unsqueeze(0),
+                    responses[idx].unsqueeze(0),
+                    torch.cat([queries[idx], responses[idx]]).unsqueeze(0),
+                )
                 all_stats.append(train_stats)
         timing["time/ppo/optimize_step"] = time.time() - t
 
@@ -749,7 +734,7 @@ class PPOTrainer(BaseTrainer):
         query: torch.LongTensor,
         response: torch.LongTensor,
         model_input: torch.LongTensor,
-        mask: torch.longTensor,
+        mask: torch.LongTensor,
     ):
         """
         Calculate policy and value losses.
@@ -768,15 +753,17 @@ class PPOTrainer(BaseTrainer):
             model_input (`torch.LongTensor`):
                 Concatenated queries and responses, shape (`batch_size`, `query_length+response_length`)
         """
+        breakpoint()
         lastgaelam = 0
         advantages_reversed = []
         gen_len = rewards.shape[-1]
-        count = torch.ones(values.shape(0)) # this variable dictates how far to look in to the future 
-        not_last = torch.zeros(values.shape(0)) # this will be used as a mask to block updates on actions at the end of an epoch
-        indexes_to_update_to =  torch.arrange(0,values.shape(0))
+        count = torch.ones(values.size()[0]) # this variable dictates how far to look in to the future 
+        not_last = torch.zeros(values.size()[0]) # this will be used as a mask to block updates on actions at the end of an epoch
+        indexes_to_update_to =  torch.arange(0,values.size()[0])
+        breakpoint()
         for t in reversed(range(gen_len)):
 
-            time_steps_to_update =mask[:,t]*not_last  if t < gen_len - 1 else torch.zeros(values.shape(0))
+            time_steps_to_update =mask[:,t]*not_last  if t < gen_len - 1 else torch.zeros(values.size()[0])
             not_last+=mask[:,t]
             not_last[not_last>=1] = 1
             count=count+1-mask[:,t]
@@ -854,6 +841,113 @@ class PPOTrainer(BaseTrainer):
             ),
         )
         return pg_loss, self.config.vf_coef * vf_loss, flatten_dict(stats)
+
+
+    def loss(
+        self,
+        old_logprobs: torch.FloatTensor,
+        values: torch.FloatTensor,
+        rewards: torch.FloatTensor,
+        query: torch.LongTensor,
+        response: torch.LongTensor,
+        model_input: torch.LongTensor,
+    ):
+        """
+        Calculate policy and value losses.
+
+        Args:
+            old_logprobs (`torch.FloatTensor`):
+                Log probabilities of the model, shape (`batch_size`, `response_length`)
+            values (`torch.FloatTensor`):
+                Values of the value head, shape (`batch_size`, `hidden_dim`)
+            rewards (`torch.FloatTensor`):
+                Rewards from the reward model, shape (`batch_size`)
+            query (`torch.LongTensor`):
+                Encoded queries, shape (`batch_size`, `query_length`)
+            response (`torch.LongTensor`):
+                Encoded responses, shape (`batch_size`, `response_length`)
+            model_input (`torch.LongTensor`):
+                Concatenated queries and responses, shape (`batch_size`, `query_length+response_length`)
+        """
+        lastgaelam = 0
+        advantages_reversed = []
+        gen_len = rewards.shape[-1]
+
+        for t in reversed(range(gen_len)):
+            nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
+            delta = rewards[:, t] + self.config.gamma * nextvalues - values[:, t]
+            lastgaelam = delta + self.config.gamma * self.config.lam * lastgaelam
+            advantages_reversed.append(lastgaelam)
+        advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
+
+        returns = advantages + values
+        advantages = whiten(advantages)
+        advantages = advantages.detach()
+
+        input_kwargs = {
+            "input_ids": model_input,
+        }
+
+        if self.is_encoder_decoder:
+            input_kwargs["input_ids"] = query
+            input_kwargs["decoder_input_ids"] = response
+            model_input = response
+
+        logits, _, vpred = self.model(**input_kwargs)
+
+        if self.is_encoder_decoder:
+            logprob = logprobs_from_logits(logits[:, :-1, :], model_input[:, 1:])
+            start, end = 1, response.shape[-1] - 1
+            vpred = vpred[:, start - 1 : end - 1]
+            logprob = logprob[:, start:end]
+        else:
+            logprob = logprobs_from_logits(logits[:, :-1, :], model_input[:, 1:])
+            logprob, vpred = logprob[:, -gen_len:], vpred[:, -gen_len - 1 : -1]
+
+        vpredclipped = clip_by_value(vpred, values - self.config.cliprange_value, values + self.config.cliprange_value)
+
+        vf_losses1 = (vpred - returns) ** 2
+        vf_losses2 = (vpredclipped - returns) ** 2
+        vf_loss = 0.5 * torch.mean(torch.max(vf_losses1, vf_losses2))
+        vf_clipfrac = torch.mean(torch.gt(vf_losses2, vf_losses1).double())
+
+        ratio = torch.exp(logprob - old_logprobs)
+        pg_losses = -advantages * ratio
+        pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - self.config.cliprange, 1.0 + self.config.cliprange)
+
+        pg_loss = torch.mean(torch.max(pg_losses, pg_losses2))
+        pg_clipfrac = torch.mean(torch.gt(pg_losses2, pg_losses).double())
+
+        loss = pg_loss + self.config.vf_coef * vf_loss
+
+        entropy = torch.mean(entropy_from_logits(logits))
+        approxkl = 0.5 * torch.mean((logprob - old_logprobs) ** 2)
+        policykl = torch.mean(logprob - old_logprobs)
+        return_mean, return_var = torch.mean(returns), torch.var(returns)
+        value_mean, value_var = torch.mean(values), torch.var(values)
+
+        stats = dict(
+            loss=dict(policy=pg_loss, value=vf_loss, total=loss),
+            policy=dict(
+                entropy=entropy,
+                approxkl=approxkl,
+                policykl=policykl,
+                clipfrac=pg_clipfrac,
+                advantages=advantages,
+                advantages_mean=torch.mean(advantages),
+                ratio=ratio,
+            ),
+            returns=dict(mean=return_mean, var=return_var),
+            val=dict(
+                vpred=torch.mean(vpred),
+                error=torch.mean((vpred - returns) ** 2),
+                clipfrac=vf_clipfrac,
+                mean=value_mean,
+                var=value_var,
+            ),
+        )
+        return pg_loss, self.config.vf_coef * vf_loss, flatten_dict(stats)
+
 
     def record_step_stats(self, kl_coef: float, **data):
         """
