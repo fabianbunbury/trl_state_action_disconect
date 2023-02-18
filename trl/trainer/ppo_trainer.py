@@ -408,8 +408,10 @@ class PPOTrainer(BaseTrainer):
             self,
             queries: List[torch.LongTensor],
             responses: List[torch.LongTensor],
-            scores: List[torch.FloatTensor]
+            scores: List[torch.FloatTensor],
+            mask: List[torch.LongTensor],
         ):
+
         """
             Run a PPO optimisation step given a list of queries, model responses, and rewards.
 
@@ -518,14 +520,24 @@ class PPOTrainer(BaseTrainer):
             random.shuffle(idxs)
             for i in range(bs):
                 idx = idxs[i]
-                train_stats = self.train_minibatch(
-                    logprobs[idx].unsqueeze(0),
-                    values[idx].unsqueeze(0),
-                    rewards[idx].unsqueeze(0),
-                    queries[idx].unsqueeze(0),
-                    responses[idx].unsqueeze(0),
-                    torch.cat([queries[idx], responses[idx]]).unsqueeze(0),
-                )
+
+                # train_stats = self.train_minibatch(
+                #     logprobs[idx].unsqueeze(0),
+                #     values[idx].unsqueeze(0),
+                #     rewards[idx].unsqueeze(0),
+                #     queries[idx].unsqueeze(0),
+                #     responses[idx].unsqueeze(0),
+                #     torch.cat([queries[idx], responses[idx]]).unsqueeze(0),
+                # )
+
+                loss_p, loss_v, train_stats = self.loss(logprobs, values, rewards, query, response, model_input, mask)
+                loss = loss_p + loss_v
+                self.optimizer.zero_grad()
+                self.accelerator.backward(loss)
+                t = time.time()
+                self.optimizer.step()
+                train_stats["time/ppo/optimizer_step"] = torch.Tensor([time.time() - t]).to(self.accelerator.device)
+
                 all_stats.append(train_stats)
         timing["time/ppo/optimize_step"] = time.time() - t
 
@@ -729,7 +741,7 @@ class PPOTrainer(BaseTrainer):
             rewards.append(reward)
         return rewards, non_score_rewards
 
-    def loss(
+    def masked_loss(
         self,
         old_logprobs: torch.FloatTensor,
         values: torch.FloatTensor,
@@ -737,6 +749,7 @@ class PPOTrainer(BaseTrainer):
         query: torch.LongTensor,
         response: torch.LongTensor,
         model_input: torch.LongTensor,
+        mask: torch.longTensor,
     ):
         """
         Calculate policy and value losses.
