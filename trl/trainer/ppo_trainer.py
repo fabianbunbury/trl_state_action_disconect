@@ -467,9 +467,47 @@ class PPOTrainer(BaseTrainer):
                 all_stats.append(train_stats)
         timing["time/ppo/optimize_step"] = time.time() - t
 
+        t = time.time()
+        train_stats = stack_dicts(all_stats)
+
+        # reshape advantages/ratios such that they are not averaged.
+        train_stats["policy/advantages"] = torch.flatten(train_stats["policy/advantages"]).unsqueeze(0)
+        train_stats["policy/advantages"] = torch.nan_to_num(train_stats["policy/advantages"], WANDB_PADDING)
+        train_stats["policy/ratio"] = torch.flatten(train_stats["policy/ratio"]).unsqueeze(0)
+
+        stats = self.record_step_stats(
+            scores=scores,
+            logprobs=logprobs,
+            ref_logprobs=ref_logprobs,
+            non_score_reward=non_score_reward,
+            train_stats=train_stats,
+            kl_coef=self.kl_ctl.value,
+        )
+        # Gather/Reduce stats from all processes
+        if self.is_distributed:
+            stats = self.gather_stats(stats)
+        stats = stats_to_np(stats)
+        timing["time/ppo/calc_stats"] = time.time() - t
+        stats["ppo/learning_rate"] = self.optimizer.param_groups[0]["lr"]
+
+        # Update the KL control - multiply the batch_size by the number of processes
+        self.kl_ctl.update(stats["objective/kl"], self.config.batch_size * self.accelerator.num_processes)
+
+        # Log the total ppo time
+        timing["time/ppo/total"] = time.time() - t0
+        stats.update(timing)
+
+        # post-process stats for tensorboard and other loggers
+        if self.config.log_with != "wandb":
+            stats = convert_to_scalar(stats)
+
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+
+        return stats
 
 
-        
+
     def step(
         self,
         queries: List[torch.LongTensor],
@@ -751,27 +789,33 @@ class PPOTrainer(BaseTrainer):
             model_input (`torch.LongTensor`):
                 Concatenated queries and responses, shape (`batch_size`, `query_length+response_length`)
         """
+        batch_size = values.size()[0]
         lastgaelam = 0
         advantages_reversed = []
         gen_len = rewards.shape[-1]
-        count = torch.ones(values.size()[0],device = 'cuda',dtype=torch.int64) # this variable dictates how far to look in to the future 
-        not_last = torch.zeros(values.size()[0],device = 'cuda',dtype=torch.int64) # this will be used as a mask to block updates on actions at the end of an epoch
-        indexes_to_update_to =  torch.arange(0,values.size()[0],device = 'cuda',dtype=torch.int64)
+        count = torch.zeros(batch_size,device = 'cuda',dtype=torch.int64) # this variable dictates how far to look in to the future to find the correct value function
+        not_last = torch.zeros(batch_size,device = 'cuda',dtype=torch.int64) # this will be used as a mask to block updates on actions at the end of an epoch
+        indexes_to_update_to =  torch.arange(0,batch_size,device = 'cuda',dtype=torch.int64)
+        temp = torch.tensor([gen_len-1]*batch_size,device = 'cuda',dtype=torch.int64)
+        zeros_for_end = torch.zeros(values.size()[0],device = 'cuda', dtype=torch.int64)
 
-        breakpoint()
         for t in reversed(range(gen_len)):
 
-            time_steps_to_update =mask[:,t]*not_last  if t < gen_len - 1 else torch.zeros(values.size()[0],device = 'cuda', dtype=torch.int64)
+            time_steps_to_update = mask[:,t]*not_last  if t < gen_len - 1 else zeros_for_end
             not_last+=mask[:,t]
             not_last[not_last>=1] = 1
-            count=count+1-mask[:,t]
-            temp = count+t
+           
             nextvalues = values[indexes_to_update_to, temp] *time_steps_to_update
+
+            count[mask[:,t] ==1] = 1
+            count[mask[:,t] ==0] +=1
+            # print('temp = '+str(temp[0]) )
+            temp = count+t-1
 
             delta = rewards[:, t] + self.config.gamma * nextvalues - values[:, t]
             lastgaelam = delta + self.config.gamma * self.config.lam * lastgaelam
             advantages_reversed.append(lastgaelam)
-        advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
+        advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)*mask
 
         returns = advantages + values
         advantages = whiten(advantages)
@@ -799,8 +843,8 @@ class PPOTrainer(BaseTrainer):
 
         vpredclipped = clip_by_value(vpred, values - self.config.cliprange_value, values + self.config.cliprange_value)
 
-        vf_losses1 = (vpred - returns) ** 2
-        vf_losses2 = (vpredclipped - returns) ** 2
+        vf_losses1 = mask*(vpred - returns) ** 2
+        vf_losses2 = mask*(vpredclipped - returns) ** 2
         vf_loss = 0.5 * torch.mean(torch.max(vf_losses1, vf_losses2))
         vf_clipfrac = torch.mean(torch.gt(vf_losses2, vf_losses1).double())
 
