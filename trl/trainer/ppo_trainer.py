@@ -428,7 +428,6 @@ class PPOTrainer(BaseTrainer):
         """
 
         bs = self.config.batch_size
-
         queries, responses, scores = self._step_safety_checker(bs, queries, responses, scores)
 
         timing = dict()
@@ -450,7 +449,6 @@ class PPOTrainer(BaseTrainer):
             for i in range(bs):
                 idx = idxs[i]
 
-                breakpoint()
                 loss_p, loss_v, train_stats = self.masked_loss(logprobs[idx].unsqueeze(0), 
                                                         values[idx].unsqueeze(0), 
                                                         rewards[idx].unsqueeze(0),
@@ -753,21 +751,22 @@ class PPOTrainer(BaseTrainer):
             model_input (`torch.LongTensor`):
                 Concatenated queries and responses, shape (`batch_size`, `query_length+response_length`)
         """
-        breakpoint()
         lastgaelam = 0
         advantages_reversed = []
         gen_len = rewards.shape[-1]
-        count = torch.ones(values.size()[0]) # this variable dictates how far to look in to the future 
-        not_last = torch.zeros(values.size()[0]) # this will be used as a mask to block updates on actions at the end of an epoch
-        indexes_to_update_to =  torch.arange(0,values.size()[0])
+        count = torch.ones(values.size()[0],device = 'cuda',dtype=torch.int64) # this variable dictates how far to look in to the future 
+        not_last = torch.zeros(values.size()[0],device = 'cuda',dtype=torch.int64) # this will be used as a mask to block updates on actions at the end of an epoch
+        indexes_to_update_to =  torch.arange(0,values.size()[0],device = 'cuda',dtype=torch.int64)
+
         breakpoint()
         for t in reversed(range(gen_len)):
 
-            time_steps_to_update =mask[:,t]*not_last  if t < gen_len - 1 else torch.zeros(values.size()[0])
+            time_steps_to_update =mask[:,t]*not_last  if t < gen_len - 1 else torch.zeros(values.size()[0],device = 'cuda', dtype=torch.int64)
             not_last+=mask[:,t]
             not_last[not_last>=1] = 1
             count=count+1-mask[:,t]
-            nextvalues = values[indexes_to_update_to, t+count] *time_steps_to_update
+            temp = count+t
+            nextvalues = values[indexes_to_update_to, temp] *time_steps_to_update
 
             delta = rewards[:, t] + self.config.gamma * nextvalues - values[:, t]
             lastgaelam = delta + self.config.gamma * self.config.lam * lastgaelam
